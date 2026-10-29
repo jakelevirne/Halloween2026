@@ -1,7 +1,7 @@
 #!/bin/bash
-# Wrapper script to run hauntedHouseLoop2025.py with auto-restart on crash
+# Wrapper script to run hauntedHouseLoop2026.py with auto-restart on crash
 
-SCRIPT_NAME="hauntedHouseLoop2025.py"
+SCRIPT_NAME="hauntedHouseLoop2026.py"
 
 echo "Starting $SCRIPT_NAME with auto-restart..."
 echo "Press Ctrl+C to stop completely"

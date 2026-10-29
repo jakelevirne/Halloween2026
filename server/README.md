@@ -15,7 +15,7 @@ uv sync
 
 ```bash
 # Run the haunted house control loop
-uv run hauntedHouseLoop.py
+uv run hauntedHouseLoop2026.py   # or ./runLoop.sh to auto-restart on crash
 ```
 
 ## Props & Sensors
