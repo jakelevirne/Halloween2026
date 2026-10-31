@@ -9,3 +9,4 @@ __pycache__/
 
 # Generated data and analysis outputs
 server/data/
+server/radarMaps/live.log

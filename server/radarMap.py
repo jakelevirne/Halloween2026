@@ -15,6 +15,14 @@ Layout: in review mode, drag to draw a rectangle (a room, a prop, a trigger
 zone), type a label and press Enter. Right-click (two-finger click) a rectangle
 to delete it. Rectangles are saved to radarMaps/layout.json and always drawn.
 
+People: targets are tracked with peopleTracker.py and only count as people
+once they've come through the entrance (the dashed yellow box in layout.json).
+Anything else, like the garage door reflection, shows as a grey x. Someone
+already in the room when the app starts needs to walk through the entrance.
+
+Every radar report is also written to radarMaps/live.log (cleared on startup),
+so the live data can be followed with: tail -f radarMaps/live.log
+
 Usage:
     uv run radarMap.py
 
@@ -36,6 +44,7 @@ from matplotlib.patches import Circle, Rectangle
 from matplotlib.widgets import TextBox
 
 from ld2460Radar import watch
+from peopleTracker import PeopleTracker
 
 MAX_RANGE_M = 5
 DETECTION_RADIUS_M = 4  # ceiling mode covers about 4 m around the radar
@@ -44,9 +53,10 @@ ROOM_DEPTH_FT = 20      # along y
 FEET_PER_M = 3.2808
 TRAIL_SECONDS = 2
 BACKGROUND = "#2f6fcf"
-COLORS = ["#ffd400", "#00e5ff", "#ff5cf4", "#7dff6b", "#ff8c42"]  # one per target slot (up to 5)
+COLORS = ["#ffd400", "#00e5ff", "#ff5cf4", "#7dff6b", "#ff8c42"]  # picked by person ID
 WALKS_DIR = Path(__file__).resolve().parent / "radarMaps"
 LAYOUT_FILE = WALKS_DIR / "layout.json"
+LIVE_LOG = WALKS_DIR / "live.log"  # every report, one line each, cleared on startup (tail -f it)
 AREA_COLOR = "#7dff6b"
 
 
@@ -55,17 +65,37 @@ class RadarState:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.reports = deque(maxlen=200)  # (time, [(x, y), ...])
+        # (time, people, others), each a list of (id, x, y, lost). Others are unconfirmed tracks.
+        self.reports = deque(maxlen=200)
         self.mapping = False
         self.walk = []  # (seconds since mapping started, target, x, y)
         self._walk_start = 0
+        self.log_file = None
+        self.ignores = load_ignores()
+        self.tracker = PeopleTracker(load_entrance())
+
+    def open_live_log(self):
+        WALKS_DIR.mkdir(exist_ok=True)
+        self.log_file = open(LIVE_LOG, "w", buffering=1)  # line buffered, so tail -f sees each report
 
     def add(self, targets):
+        ignored = [(x, y) for x, y in targets if is_ignored(x, y, self.ignores)]
+        targets = [(x, y) for x, y in targets if not is_ignored(x, y, self.ignores)]
         with self.lock:
             now = time.monotonic()
-            self.reports.append((now, targets))
+            people, others = self.tracker.update(targets, now)
+            people = [(t.id, t.x, t.y, t.lost(now)) for t in people]
+            others = [(t.id, t.x, t.y, t.lost(now)) for t in others]
+            self.reports.append((now, people, others))
             if self.mapping:
                 self.walk += [(now - self._walk_start, i, x, y) for i, (x, y) in enumerate(targets)]
+            if self.log_file:
+                timestamp = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+                tracked = "  ".join(f"#{i} x={x:+.1f} y={y:+.1f}{' lost' if lost else ''}" for i, x, y, lost in people)
+                unconfirmed = "  ".join(f"?{i} x={x:+.1f} y={y:+.1f}" for i, x, y, lost in others if not lost)
+                dropped = "  ".join(f"ignored x={x:+.1f} y={y:+.1f}" for x, y in ignored)
+                self.log_file.write(f"{timestamp}  people={len(people)}  {tracked}  {unconfirmed}  {dropped}"
+                                    .rstrip() + "\n")
 
     def recent(self, seconds):
         cutoff = time.monotonic() - seconds
@@ -115,9 +145,31 @@ def load_layout():
     return json.loads(LAYOUT_FILE.read_text())["areas"]
 
 
+def load_ignores():
+    """Circles where the radar sees things that aren't people (like the disco ball):
+    [{"label", "x", "y", "r"}, ...] in meters. Targets inside them are dropped."""
+    if not LAYOUT_FILE.exists():
+        return []
+    return json.loads(LAYOUT_FILE.read_text()).get("ignore", [])
+
+
+def load_entrance():
+    """The only way in and out: {"x0", "y0", "x1", "y1"} in meters, or None."""
+    if not LAYOUT_FILE.exists():
+        return None
+    return json.loads(LAYOUT_FILE.read_text()).get("entrance")
+
+
+def is_ignored(x, y, ignores):
+    return any((x - c["x"]) ** 2 + (y - c["y"]) ** 2 <= c["r"] ** 2 for c in ignores)
+
+
 def save_layout(areas):
+    # Keep the rest of the file (like the ignore circles) and replace just the areas
+    layout = json.loads(LAYOUT_FILE.read_text()) if LAYOUT_FILE.exists() else {}
+    layout["areas"] = areas
     WALKS_DIR.mkdir(exist_ok=True)
-    LAYOUT_FILE.write_text(json.dumps({"areas": areas}, indent=2) + "\n")
+    LAYOUT_FILE.write_text(json.dumps(layout, indent=2) + "\n")
 
 
 def start_radar_thread(state):
@@ -182,6 +234,20 @@ def make_map(state):
             area_artists.append(ax.text((x0 + x1) / 2, (y0 + y1) / 2, area["label"], color="white", fontsize=10,
                                         fontweight="bold", ha="center", va="center", zorder=2))
 
+    # Ignore circles: spots where the radar sees things that aren't people
+    for c in state.ignores:
+        ax.add_patch(Circle((c["x"], c["y"]), c["r"], fc=to_rgba("#ff2020", 0.5), ec="#ff2020", lw=2.5, zorder=3))
+        ax.text(c["x"], c["y"] + c["r"] + 0.05, f"{c['label']} (ignored)", color="white", fontsize=9,
+                ha="center", va="bottom", zorder=3,
+                bbox=dict(boxstyle="round,pad=0.2", fc="#ff2020", alpha=0.8, lw=0))
+
+    entrance = state.tracker.entrance
+    if entrance:
+        ax.add_patch(Rectangle((entrance["x0"], entrance["y0"]), entrance["x1"] - entrance["x0"],
+                               entrance["y1"] - entrance["y0"], fill=False, ec="#ffd400", ls="--", lw=2, zorder=3))
+        ax.text(entrance["x1"] + 0.1, (entrance["y0"] + entrance["y1"]) / 2, "Entrance", color="#ffd400",
+                fontsize=9, fontweight="bold", va="center", zorder=3)
+
     def area_at(x, y):
         """The smallest area containing (x, y), or None."""
         hits = [a for a in areas if a["x0"] <= x <= a["x1"] and a["y0"] <= y <= a["y1"]]
@@ -197,42 +263,48 @@ def make_map(state):
     label_ax.set_visible(False)
 
     trail = ax.scatter([], [], s=40, lw=0)
+    unconfirmed = ax.scatter([], [], s=80, marker="x", c="#c0c0c0", linewidths=2, zorder=3)
     dots = ax.scatter([], [], s=260, edgecolors="black", linewidths=1.5, zorder=3)
     labels = [ax.text(0, 0, "", fontsize=10, fontweight="bold", zorder=4,
                       bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6, lw=0))
               for _ in COLORS]
     status = ax.text(-limit, limit, "", color="white", fontsize=13, va="top")
+    nan_point = [(float("nan"), float("nan"))]
 
     def update(_frame=None):
         now = time.monotonic()
         reports = state.recent(TRAIL_SECONDS)
 
-        # Trail: earlier positions, fading out with age
+        # Trail: earlier positions of people, fading out with age
         points, colors = [], []
-        for t, targets in reports[:-1]:
+        for t, people, _ in reports[:-1]:
             fade = 1 - (now - t) / TRAIL_SECONDS
-            for i, (x, y) in enumerate(targets[:len(COLORS)]):
-                points.append((x, y))
-                colors.append(to_rgba(COLORS[i], alpha=0.6 * fade))
-        trail.set_offsets(points or [(float("nan"), float("nan"))])
+            for person_id, x, y, lost in people:
+                if not lost:
+                    points.append((x, y))
+                    colors.append(to_rgba(COLORS[person_id % len(COLORS)], alpha=0.6 * fade))
+        trail.set_offsets(points or nan_point)
         trail.set_facecolors(colors or ["none"])
 
-        # Current positions
-        targets = reports[-1][1] if reports and now - reports[-1][0] < 1 else []
-        targets = targets[:len(COLORS)]
+        # Current positions. Lost people (not seen for a moment) are drawn faded.
+        recent = reports and now - reports[-1][0] < 1
+        people = reports[-1][1][:len(labels)] if recent else []
+        others = [(x, y) for _, x, y, lost in reports[-1][2] if not lost] if recent else []
         if reviewing:
-            targets = []
-            trail.set_offsets([(float("nan"), float("nan"))])
-        dots.set_offsets([(x, y) for x, y in targets] or [(float("nan"), float("nan"))])
-        dots.set_facecolors(COLORS[:len(targets)] or ["none"])
-        occupied = [area_at(x, y) for x, y in targets]
+            people, others = [], []
+            trail.set_offsets(nan_point)
+        dots.set_offsets([(x, y) for _, x, y, _ in people] or nan_point)
+        dots.set_facecolors([to_rgba(COLORS[i % len(COLORS)], 0.3 if lost else 1) for i, _, _, lost in people]
+                            or ["none"])
+        unconfirmed.set_offsets(others or nan_point)
+        occupied = [area_at(x, y) for _, x, y, _ in people]
         for i, label in enumerate(labels):
-            if i < len(targets):
-                x, y = targets[i]
+            if i < len(people):
+                person_id, x, y, lost = people[i]
                 label.set_position((x + 0.2, y + 0.2))
                 where = f"  in {occupied[i]['label']}" if occupied[i] else ""
-                label.set_text(f"#{i + 1}  x={x:+.1f}m  y={y:+.1f}m{where}")
-                label.set_color(COLORS[i])
+                label.set_text(f"#{person_id}  x={x:+.1f}m  y={y:+.1f}m{where}{'  (lost)' if lost else ''}")
+                label.set_color(COLORS[person_id % len(COLORS)])
             else:
                 label.set_text("")
         # Light up areas with someone in them
@@ -250,10 +322,11 @@ def make_map(state):
             status.set_text("Waiting for radar…")
         else:
             rate = len(reports) / TRAIL_SECONDS
-            people = "nobody" if not targets else f"{len(targets)} {'person' if len(targets) == 1 else 'people'}"
-            status.set_text(f"{people}   ({rate:.0f} reports/s)")
+            count = "nobody" if not people else f"{len(people)} {'person' if len(people) == 1 else 'people'}"
+            extra = f"  + {len(others)} unconfirmed" if others else ""
+            status.set_text(f"{count}{extra}   ({rate:.0f} reports/s)")
         if state.mapping:
-            status.set_text(f"● MAPPING  {len(walk)} points   ({people if reports else 'no radar data'})")
+            status.set_text(f"● MAPPING  {len(walk)} points")
             status.set_color("#ff4040")
             help_text.set_text("Walk the walls. Press m to stop and save.")
         elif pending:
@@ -268,7 +341,7 @@ def make_map(state):
         else:
             status.set_color("white")
             help_text.set_text("m: start mapping   w: review walks and draw the layout")
-        return [walk_line, walk_dots, trail, dots, status, help_text, *labels]
+        return [walk_line, walk_dots, trail, unconfirmed, dots, status, help_text, *labels]
 
     def on_key(event):
         nonlocal saved_walk, walks, walk_index, reviewing
@@ -353,6 +426,8 @@ def make_map(state):
 
 def main():
     state = RadarState()
+    state.open_live_log()
+    print(f"Logging every radar report to {LIVE_LOG}")
     start_radar_thread(state)
     fig, update = make_map(state)
     fig.canvas.manager.set_window_title("LD2460 radar map")
