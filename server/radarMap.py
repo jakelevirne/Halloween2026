@@ -20,9 +20,11 @@ once they've come through the entrance (the dashed yellow box in layout.json).
 Anything else, like the garage door reflection, shows as a grey x. Someone
 already in the room when the app starts needs to walk through the entrance.
 
-Show dry run: showDirector.py runs the show from where people are, and its
-cues (welcome, take your seats, show, scare, goodbye, reset) appear as messages
-in the top right. Nothing is played; it's for checking the logic.
+Show: showDirector.py runs the show from where people are. Its cues (welcome,
+take your seats, show, scare, goodbye, reset) appear as messages in the panel at
+the top, and showPlayer.py plays them: the still image / Bee Gees / startle in a
+Show window, show audio on output 5 and announcements on output 6 of the UMC1820.
+With --dry-run nothing is played, for checking the logic.
 
 Every radar report is also written to radarMaps/live.log (cleared on startup),
 along with the show cues (lines starting SHOW), so the live data can be
@@ -37,10 +39,12 @@ everyone and put the show back to waiting for a group.
 
 Usage:
     uv run radarMap.py
+    uv run radarMap.py --dry-run     # show cues as messages only, no video or sound
 
 Close HLKRadarTool on your phone first: the radar takes one connection at a time.
 """
 
+import argparse
 import asyncio
 import csv
 import io
@@ -133,6 +137,7 @@ class RadarState:
         self.director = ShowDirector()
         self.request_reconnect = lambda: None  # set by start_radar_thread
         self.reset_requested = threading.Event()  # r key or the web view's Reset button; handled on the GUI thread
+        self.on_cue = lambda name: None  # set to the show player's send in main()
 
     def people_now(self):
         """Everyone the tracker counts as inside, lost or not: [(x, y), ...]."""
@@ -373,6 +378,7 @@ def make_map(state):
             cue_log.append(line)
             print(f"SHOW {line}")
             state.log(f"SHOW {cue.name}: {cue.text}")
+            state.on_cue(cue.name)
             if cue.name == "reconnect_radar":
                 state.reset_tracker()
                 state.request_reconnect()
@@ -611,6 +617,10 @@ def web_addresses():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Live radar map with the show running from it.")
+    parser.add_argument("--dry-run", action="store_true", help="Show cues as messages only, no video or sound")
+    args = parser.parse_args()
+
     state = RadarState()
     state.open_live_log()
     print(f"Logging every radar report to {LIVE_LOG}")
@@ -618,8 +628,14 @@ def main():
     fig, update = make_map(state)
     fig.canvas.manager.set_window_title("LD2460 radar map")
     start_web_view(fig, state)
+    stop_player = None
+    if not args.dry_run:
+        import showPlayer  # only needed when playing media
+        state.on_cue, stop_player = showPlayer.start_in_thread()
     _animation = FuncAnimation(fig, update, interval=50, cache_frame_data=False)  # keep a reference
     plt.show()
+    if stop_player:
+        stop_player()  # close the Show window too
 
 
 if __name__ == "__main__":
