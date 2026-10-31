@@ -9,7 +9,8 @@ Sound (the audio interface, through audioOut.py):
     output 6: the Bee Gees, silenced while the startle plays, turned down for
               the final announcement
     output 5: the announcements in media/announcements/
-    outputs 1-4: the chair bass shakers, a 45 Hz shake starting with the startle's roar
+    outputs 1-4: the chair bass shakers, a 45 Hz shake starting with the startle's roar,
+              and an unfelt 18 kHz warm-up when a group arrives so the amps aren't in standby
 
     player = ShowPlayer()
     await player.start()
@@ -34,8 +35,11 @@ ANNOUNCE_CHANNEL = 5         # powered speaker for announcements
 BASS_CHANNELS = (1, 2, 3, 4) # chair bass shakers, one per chair
 BASS_HZ = 45                 # what the shakers respond to
 BASS_LEVEL = 0.5             # the strength that felt right in the audioTest.py --tone test
-BASS_ROAR_SECONDS = 0.2      # start shaking 0.3 s before the startle's roar (0.5 s in), since the
-                             # shakers take a moment to build up and it felt late starting right on it
+BASS_ROAR_SECONDS = 0.3      # when the shake starts, from the startle's 2.6 s start point: 0.2 s before
+                             # its roar (0.5 s in), which felt better than starting right on it
+WARMUP_HZ = 18000            # a tone at the welcome to wake the amps from auto-standby (they're slow to wake,
+WARMUP_LEVEL = 0.1           # which made the shake late). Far above what the shakers reproduce (28-55 Hz), so
+WARMUP_SECONDS = 4           # it isn't felt, and too high for most adults to hear
 STILL_IMAGE = MEDIA_DIR / "BeeGeesStill.jpg"
 ANNOUNCEMENTS_DIR = MEDIA_DIR / "announcements"
 ANNOUNCEMENTS = {"welcome": "welcome.aiff", "take_seats": "take_seats.aiff", "outro": "outro.aiff"}
@@ -68,6 +72,7 @@ class ShowPlayer:
         self._scare_audio = load_audio(SCARE_VIDEO, rate, start=SCARE_START_SECONDS,
                                        filters=f"volume={SCARE_GAIN_DB}dB,alimiter=limit=0.95:level=disabled")
         self._bass = bass_shake(rate)
+        self._warmup = warmup(rate)
         self._announcements = {}
         for cue_name, file in ANNOUNCEMENTS.items():
             samples = load_audio(ANNOUNCEMENTS_DIR / file, rate)
@@ -91,6 +96,8 @@ class ShowPlayer:
     async def cue(self, name):
         """Act on a ShowDirector cue."""
         await self._ready.wait()
+        if name == "welcome":
+            self.audio.play(self._warmup, BASS_CHANNELS)
         if name in self._announcements:
             self.audio.play(self._announcements[name], ANNOUNCE_CHANNEL)
         if name == "show_start":
@@ -185,6 +192,13 @@ class ShowPlayer:
             if message.get("data") and self._showing == "bee_gees":
                 log("Bee Gees clip ended, back to the still")
                 asyncio.create_task(self._stop_show())
+
+
+def warmup(rate):
+    """A tone the shakers can't reproduce, faded in and out, to wake their amps."""
+    t = np.arange(int(rate * WARMUP_SECONDS)) / rate
+    fade = np.minimum(1, np.minimum(t, WARMUP_SECONDS - t) / 1.0)
+    return (np.sin(2 * np.pi * WARMUP_HZ * t) * fade * WARMUP_LEVEL).astype(np.float32)
 
 
 def bass_shake(rate):
