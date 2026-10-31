@@ -20,8 +20,13 @@ once they've come through the entrance (the dashed yellow box in layout.json).
 Anything else, like the garage door reflection, shows as a grey x. Someone
 already in the room when the app starts needs to walk through the entrance.
 
+Show dry run: showDirector.py runs the show from where people are, and its
+cues (welcome, take your seats, show, scare, goodbye, reset) appear as messages
+in the top right. Nothing is played; it's for checking the logic.
+
 Every radar report is also written to radarMaps/live.log (cleared on startup),
-so the live data can be followed with: tail -f radarMaps/live.log
+along with the show cues (lines starting SHOW), so the live data can be
+followed with: tail -f radarMaps/live.log
 
 Usage:
     uv run radarMap.py
@@ -45,6 +50,7 @@ from matplotlib.widgets import TextBox
 
 from ld2460Radar import watch
 from peopleTracker import PeopleTracker
+from showDirector import ShowDirector
 
 MAX_RANGE_M = 5
 DETECTION_RADIUS_M = 4  # ceiling mode covers about 4 m around the radar
@@ -71,16 +77,29 @@ class RadarState:
         self.walk = []  # (seconds since mapping started, target, x, y)
         self._walk_start = 0
         self.log_file = None
-        self.ignores = load_ignores()
-        self.tracker = PeopleTracker(load_entrance())
+        self.tracker = PeopleTracker(load_entrance(), load_reflections())
+        self.director = ShowDirector()
+        self.request_reconnect = lambda: None  # set by start_radar_thread
+
+    def people_now(self):
+        """Everyone the tracker counts as inside, lost or not: [(x, y), ...]."""
+        with self.lock:
+            return [(t.x, t.y) for t in self.tracker.tracks if t.confirmed]
+
+    def reset_tracker(self):
+        with self.lock:
+            self.tracker = PeopleTracker(self.tracker.entrance, self.tracker.reflections)
+
+    def log(self, text):
+        if self.log_file:
+            with self.lock:
+                self.log_file.write(time.strftime("%H:%M:%S") + f"  {text}\n")
 
     def open_live_log(self):
         WALKS_DIR.mkdir(exist_ok=True)
         self.log_file = open(LIVE_LOG, "w", buffering=1)  # line buffered, so tail -f sees each report
 
     def add(self, targets):
-        ignored = [(x, y) for x, y in targets if is_ignored(x, y, self.ignores)]
-        targets = [(x, y) for x, y in targets if not is_ignored(x, y, self.ignores)]
         with self.lock:
             now = time.monotonic()
             people, others = self.tracker.update(targets, now)
@@ -93,9 +112,7 @@ class RadarState:
                 timestamp = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
                 tracked = "  ".join(f"#{i} x={x:+.1f} y={y:+.1f}{' lost' if lost else ''}" for i, x, y, lost in people)
                 unconfirmed = "  ".join(f"?{i} x={x:+.1f} y={y:+.1f}" for i, x, y, lost in others if not lost)
-                dropped = "  ".join(f"ignored x={x:+.1f} y={y:+.1f}" for x, y in ignored)
-                self.log_file.write(f"{timestamp}  people={len(people)}  {tracked}  {unconfirmed}  {dropped}"
-                                    .rstrip() + "\n")
+                self.log_file.write(f"{timestamp}  people={len(people)}  {tracked}  {unconfirmed}".rstrip() + "\n")
 
     def recent(self, seconds):
         cutoff = time.monotonic() - seconds
@@ -145,12 +162,13 @@ def load_layout():
     return json.loads(LAYOUT_FILE.read_text())["areas"]
 
 
-def load_ignores():
-    """Circles where the radar sees things that aren't people (like the disco ball):
-    [{"label", "x", "y", "r"}, ...] in meters. Targets inside them are dropped."""
+def load_reflections():
+    """Spots where the radar sees things that aren't people (like the disco ball):
+    [{"label", "x", "y", "r"}, ...] in meters. Nothing is dropped there; the tracker uses
+    them to tell a person apart from a reflection they walked under."""
     if not LAYOUT_FILE.exists():
         return []
-    return json.loads(LAYOUT_FILE.read_text()).get("ignore", [])
+    return json.loads(LAYOUT_FILE.read_text()).get("reflections", [])
 
 
 def load_entrance():
@@ -160,12 +178,8 @@ def load_entrance():
     return json.loads(LAYOUT_FILE.read_text()).get("entrance")
 
 
-def is_ignored(x, y, ignores):
-    return any((x - c["x"]) ** 2 + (y - c["y"]) ** 2 <= c["r"] ** 2 for c in ignores)
-
-
 def save_layout(areas):
-    # Keep the rest of the file (like the ignore circles) and replace just the areas
+    # Keep the rest of the file (entrance, reflections) and replace just the areas
     layout = json.loads(LAYOUT_FILE.read_text()) if LAYOUT_FILE.exists() else {}
     layout["areas"] = areas
     WALKS_DIR.mkdir(exist_ok=True)
@@ -173,13 +187,18 @@ def save_layout(areas):
 
 
 def start_radar_thread(state):
-    thread = threading.Thread(target=lambda: asyncio.run(watch(state.add)), daemon=True)
+    loop = asyncio.new_event_loop()
+    reconnect = asyncio.Event()
+    thread = threading.Thread(target=lambda: loop.run_until_complete(watch(state.add, reconnect=reconnect)),
+                              daemon=True)
     thread.start()
+    state.request_reconnect = lambda: loop.call_soon_threadsafe(reconnect.set)
 
 
 def make_map(state):
     """Build the figure. Returns (figure, update function for FuncAnimation)."""
-    fig, ax = plt.subplots(figsize=(8, 8.5))
+    fig, ax = plt.subplots(figsize=(8, 9.8))
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.83, bottom=0.04)  # room above the map for the show panel
     fig.patch.set_facecolor(BACKGROUND)
     ax.set_facecolor(BACKGROUND)
     ax.set_aspect("equal")
@@ -234,12 +253,18 @@ def make_map(state):
             area_artists.append(ax.text((x0 + x1) / 2, (y0 + y1) / 2, area["label"], color="white", fontsize=10,
                                         fontweight="bold", ha="center", va="center", zorder=2))
 
-    # Ignore circles: spots where the radar sees things that aren't people
-    for c in state.ignores:
-        ax.add_patch(Circle((c["x"], c["y"]), c["r"], fc=to_rgba("#ff2020", 0.5), ec="#ff2020", lw=2.5, zorder=3))
-        ax.text(c["x"], c["y"] + c["r"] + 0.05, f"{c['label']} (ignored)", color="white", fontsize=9,
+    # Reflection spots: where the radar sees things that aren't people
+    for spot in state.tracker.reflections:
+        style = dict(fill=False, ec="#ff8c42", ls="--", lw=2, zorder=3)
+        if "r" in spot:
+            ax.add_patch(Circle((spot["x"], spot["y"]), spot["r"], **style))
+            label_x, label_y = spot["x"], spot["y"] + spot["r"] + 0.05
+        else:
+            ax.add_patch(Rectangle((spot["x0"], spot["y0"]), spot["x1"] - spot["x0"], spot["y1"] - spot["y0"], **style))
+            label_x, label_y = (spot["x0"] + spot["x1"]) / 2, spot["y1"] + 0.05
+        ax.text(label_x, label_y, f"{spot['label']} (reflection)", color="white", fontsize=9,
                 ha="center", va="bottom", zorder=3,
-                bbox=dict(boxstyle="round,pad=0.2", fc="#ff2020", alpha=0.8, lw=0))
+                bbox=dict(boxstyle="round,pad=0.2", fc="#ff8c42", alpha=0.8, lw=0))
 
     entrance = state.tracker.entrance
     if entrance:
@@ -271,8 +296,27 @@ def make_map(state):
     status = ax.text(-limit, limit, "", color="white", fontsize=13, va="top")
     nan_point = [(float("nan"), float("nan"))]
 
+    # Show dry run: the director's status and recent cues
+    show_text = fig.text(0.02, 0.985, "", color="white", fontsize=9, family="monospace", va="top",
+                         bbox=dict(boxstyle="round,pad=0.4", fc="black", alpha=0.5, lw=0))
+    cue_log = deque(maxlen=6)
+
+    def run_show(now):
+        zones = [area["label"] if area else None for area in (area_at(x, y) for x, y in state.people_now())]
+        for cue in state.director.update(now, zones):
+            line = f"{time.strftime('%H:%M:%S')}  {cue.text}"
+            cue_log.append(line)
+            print(f"SHOW {line}")
+            state.log(f"SHOW {cue.name}: {cue.text}")
+            if cue.name == "reconnect_radar":
+                state.reset_tracker()
+                state.request_reconnect()
+        inside = f"{len(zones)} inside" + (f" ({', '.join(sorted(z or 'no zone' for z in zones))})" if zones else "")
+        show_text.set_text("\n".join([f"SHOW  {state.director.status(now)}", f"      {inside}", *cue_log]))
+
     def update(_frame=None):
         now = time.monotonic()
+        run_show(now)
         reports = state.recent(TRAIL_SECONDS)
 
         # Trail: earlier positions of people, fading out with age
@@ -341,7 +385,7 @@ def make_map(state):
         else:
             status.set_color("white")
             help_text.set_text("m: start mapping   w: review walks and draw the layout")
-        return [walk_line, walk_dots, trail, unconfirmed, dots, status, help_text, *labels]
+        return [walk_line, walk_dots, trail, unconfirmed, dots, status, help_text, show_text, *labels]
 
     def on_key(event):
         nonlocal saved_walk, walks, walk_index, reviewing

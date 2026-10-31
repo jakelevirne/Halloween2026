@@ -54,8 +54,10 @@ def parse_frames(buffer):
         reports.append([(x / 10, y / 10) for x, y in struct.iter_unpack("<hh", frame[7:-4])])
 
 
-async def watch(on_targets, name_prefix="LD2460"):
-    """Connect to the radar and call on_targets(list of (x, y)) for every report. Reconnects forever."""
+async def watch(on_targets, name_prefix="LD2460", reconnect=None):
+    """Connect to the radar and call on_targets(list of (x, y)) for every report. Reconnects forever.
+    Setting the optional reconnect event (an asyncio.Event) drops the connection and connects again."""
+    reconnect = reconnect or asyncio.Event()
     while True:
         device = await BleakScanner.find_device_by_filter(
             lambda d, adv: (adv.local_name or d.name or "").startswith(name_prefix), timeout=10)
@@ -74,8 +76,15 @@ async def watch(on_targets, name_prefix="LD2460"):
             async with BleakClient(device, disconnected_callback=lambda _: disconnected.set()) as client:
                 log(f"Connected to {device.name}")
                 await client.start_notify(NOTIFY_UUID, on_notify)
-                await disconnected.wait()
-            log("Radar disconnected, reconnecting")
+                waits = [asyncio.create_task(disconnected.wait()), asyncio.create_task(reconnect.wait())]
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+                for task in waits:
+                    task.cancel()
+            if reconnect.is_set():
+                reconnect.clear()
+                log("Reconnecting to the radar as requested")
+            else:
+                log("Radar disconnected, reconnecting")
         except Exception as e:
             log(f"Radar connection failed ({e}), retrying")
             await asyncio.sleep(2)
