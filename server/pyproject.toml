@@ -8,4 +8,5 @@ dependencies = [
     "matplotlib>=3.8.0",
     "sounddevice>=0.5.3",
     "soundfile>=0.13.1",
+    "bleak>=3.0.2",
 ]

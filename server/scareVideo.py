@@ -59,6 +59,7 @@ SCARE_VIDEO = MEDIA_DIR / "PP_StartleScare1_Wall_Spotlight_H.mp4"
 SCARE_START_SECONDS = 2.6      # about half a second of near-silence before the startle hits at ~3.1s
 SCARE_MODE = "blend"           # "blend" or "cut"
 BLEND_MODE = "lighten"         # any ffmpeg blend mode: lighten, screen, addition, ...
+LOOP_DIM = 0.35                # blend mode: loop video brightness during the scare (1 = normal, 0 = black)
 SCARE_AUDIO_DELAY = 0.1        # the scare video takes ~0.1s longer to appear than the audio
 # The Bee Gees track is mastered near full scale (-8.5 LUFS) and the startle is ~6 dB quieter,
 # so turn the loop down and the scare up (with a limiter so the boost doesn't clip).
@@ -282,7 +283,8 @@ class ScareVideoPlayer:
             f"movie={self.scare_video}:seek_point={self.scare_start},trim=start={self.scare_start},"
             # Shift the scare's timestamps so its first frame lines up with the loop video's current frame
             f"setpts=PTS-STARTPTS+{position}/TB,scale={width}:{height},format=gbrp[top];"
-            f"[vid1]format=gbrp[bottom];"
+            # Dim the loop video so the scare stands out
+            f"[vid1]format=gbrp,colorchannelmixer=rr={LOOP_DIM}:gg={LOOP_DIM}:bb={LOOP_DIM}[bottom];"
             # Blend in RGB so the loop video keeps its colors. Once the scare ends, pass the loop video through.
             f"[bottom][top]blend=all_mode={self.blend_mode}:eof_action=pass[vo];"
             # Audio stays connected so the track never changes (that stalls playback). It's muted instead.
