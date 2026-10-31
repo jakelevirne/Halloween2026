@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 BACKSTAGE = "Backstage"        # zone labels in radarMaps/layout.json
 MAIN_STAGE = "Main stage"
+ENTRANCE = "Entrance"          # in the entrance but past the stairs: at the door or outside, so not inside
 BACKSTAGE_SECONDS = 20         # first person in Backstage -> "take your seats"...
 MAIN_STAGE_SECONDS = 5         # ...or first person in Main stage -> "take your seats", whichever is first
 SEATING_SECONDS = 15           # "take your seats" -> show (or ask again)
@@ -51,8 +52,10 @@ class ShowDirector:
         self._scare_at = 0.0
 
     def update(self, now, zones):
-        """now: seconds (any steady clock). zones: one entry per person inside, the zone label
-        they're in or None. Returns a list of Cues to act on now."""
+        """now: seconds (any steady clock). zones: one entry per tracked person, the zone label
+        they're in, ENTRANCE if they're at the door past the stairs, or None.
+        Returns a list of Cues to act on now."""
+        zones = [zone for zone in zones if zone != ENTRANCE]  # at the door counts as gone
         inside = len(zones) > 0
         main_stage = zones.count(MAIN_STAGE)
         elapsed = now - self._since
@@ -117,6 +120,10 @@ class ShowDirector:
         """Seconds until the take-your-seats call, during the welcome (inf if nobody has reached a stage)."""
         waits = {BACKSTAGE: BACKSTAGE_SECONDS, MAIN_STAGE: MAIN_STAGE_SECONDS}
         return min((since + waits[zone] - now for zone, since in self._first_in.items()), default=float("inf"))
+
+    def reset(self, now):
+        """Back to waiting for a group, e.g. when the operator resets by hand."""
+        return self._go("empty", now, Cue("reset", "Manual reset. Ready for the next group."))
 
     def _go(self, state, now, *cues):
         self.state = state

@@ -28,6 +28,13 @@ Every radar report is also written to radarMaps/live.log (cleared on startup),
 along with the show cues (lines starting SHOW), so the live data can be
 followed with: tail -f radarMaps/live.log
 
+Web view: the map is also served at http://<this mac>:8460 for a phone or another
+computer on the same network (or Tailscale). The page shows a picture of the map,
+refreshed about twice a second, with a Reset show button.
+
+Manual reset: press r in the map window (or Reset show on the web view) to clear
+everyone and put the show back to waiting for a group.
+
 Usage:
     uv run radarMap.py
 
@@ -36,10 +43,15 @@ Close HLKRadarTool on your phone first: the radar takes one connection at a time
 
 import asyncio
 import csv
+import io
 import json
+import shutil
+import socket
+import subprocess
 import threading
 import time
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -47,10 +59,11 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.colors import to_rgba
 from matplotlib.patches import Circle, Rectangle
 from matplotlib.widgets import TextBox
+from PIL import Image
 
 from ld2460Radar import watch
 from peopleTracker import PeopleTracker
-from showDirector import ShowDirector
+from showDirector import ENTRANCE, ShowDirector
 
 MAX_RANGE_M = 5
 DETECTION_RADIUS_M = 4  # ceiling mode covers about 4 m around the radar
@@ -64,6 +77,45 @@ WALKS_DIR = Path(__file__).resolve().parent / "radarMaps"
 LAYOUT_FILE = WALKS_DIR / "layout.json"
 LIVE_LOG = WALKS_DIR / "live.log"  # every report, one line each, cleared on startup (tail -f it)
 AREA_COLOR = "#7dff6b"
+WEB_PORT = 8460
+WEB_FRAME_SECONDS = 0.5  # how often the web view's picture is refreshed
+WEB_WIDTH = 900          # pixels
+WEB_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radar map</title>
+<style>
+  body { margin: 0; background: #2f6fcf; font-family: -apple-system, sans-serif; }
+  img { display: block; width: 100%; max-width: 900px; margin: auto; }
+  .controls { text-align: center; padding: 12px; color: white; }
+  button { font-size: 18px; padding: 10px 24px; border: 0; border-radius: 8px; background: #ff4040; color: white; }
+</style>
+</head><body><img id="map" src="map.jpg" alt="radar map">
+<div class="controls"><button id="reset">Reset show</button> <span id="note"></span></div>
+<script>
+  // Reset: clears everyone and puts the show back to waiting for a group
+  document.getElementById("reset").onclick = async () => {
+    if (!confirm("Reset the show and clear everyone from the map?")) return;
+    const note = document.getElementById("note");
+    try {
+      const response = await fetch("reset", { method: "POST" });
+      note.textContent = response.ok ? "Reset sent" : "Reset failed";
+    } catch (e) {
+      note.textContent = "Reset failed";
+    }
+    setTimeout(() => note.textContent = "", 3000);
+  };
+
+  // Load each new frame off screen and swap it in, so the picture never flickers
+  const map = document.getElementById("map");
+  function next() {
+    const frame = new Image();
+    frame.onload = () => { map.src = frame.src; setTimeout(next, 400); };
+    frame.onerror = () => setTimeout(next, 2000);
+    frame.src = "map.jpg?" + Date.now();
+  }
+  next();
+</script></body></html>
+"""
 
 
 class RadarState:
@@ -80,6 +132,7 @@ class RadarState:
         self.tracker = PeopleTracker(load_entrance(), load_reflections())
         self.director = ShowDirector()
         self.request_reconnect = lambda: None  # set by start_radar_thread
+        self.reset_requested = threading.Event()  # r key or the web view's Reset button; handled on the GUI thread
 
     def people_now(self):
         """Everyone the tracker counts as inside, lost or not: [(x, y), ...]."""
@@ -301,9 +354,21 @@ def make_map(state):
                          bbox=dict(boxstyle="round,pad=0.4", fc="black", alpha=0.5, lw=0))
     cue_log = deque(maxlen=6)
 
+    def zone_for_show(x, y):
+        # The Stairs zone overlaps the bottom of the entrance, so the entrance only wins past the stairs
+        area = area_at(x, y)
+        if area:
+            return area["label"]
+        return ENTRANCE if state.tracker.in_entrance(x, y) else None
+
     def run_show(now):
-        zones = [area["label"] if area else None for area in (area_at(x, y) for x, y in state.people_now())]
-        for cue in state.director.update(now, zones):
+        cues = []
+        if state.reset_requested.is_set():
+            state.reset_requested.clear()
+            state.reset_tracker()
+            cues += state.director.reset(now)
+        zones = [zone_for_show(x, y) for x, y in state.people_now()]
+        for cue in cues + state.director.update(now, zones):
             line = f"{time.strftime('%H:%M:%S')}  {cue.text}"
             cue_log.append(line)
             print(f"SHOW {line}")
@@ -311,7 +376,8 @@ def make_map(state):
             if cue.name == "reconnect_radar":
                 state.reset_tracker()
                 state.request_reconnect()
-        inside = f"{len(zones)} inside" + (f" ({', '.join(sorted(z or 'no zone' for z in zones))})" if zones else "")
+        count = sum(zone != ENTRANCE for zone in zones)
+        inside = f"{count} inside" + (f" ({', '.join(sorted(z or 'no zone' for z in zones))})" if zones else "")
         show_text.set_text("\n".join([f"SHOW  {state.director.status(now)}", f"      {inside}", *cue_log]))
 
     def update(_frame=None):
@@ -384,7 +450,7 @@ def make_map(state):
                                f"w: next walk   Esc: back to live")
         else:
             status.set_color("white")
-            help_text.set_text("m: start mapping   w: review walks and draw the layout")
+            help_text.set_text("m: start mapping   w: review walks and draw the layout   r: reset the show")
         return [walk_line, walk_dots, trail, unconfirmed, dots, status, help_text, show_text, *labels]
 
     def on_key(event):
@@ -407,6 +473,8 @@ def make_map(state):
             reviewing = True
         elif event.key == "escape":
             reviewing = False
+        elif event.key == "r":
+            state.reset_requested.set()
 
     def snap(value):
         return round(value * 10) / 10  # the radar reports in 0.1 m steps
@@ -468,6 +536,80 @@ def make_map(state):
     return fig, update
 
 
+def start_web_view(fig, state):
+    """Serve the map at http://<this mac>:WEB_PORT. A JPEG of the figure is grabbed after each
+    redraw (at most every WEB_FRAME_SECONDS) on the GUI thread, since matplotlib isn't thread safe."""
+    frame = {"jpeg": b"", "time": 0.0}
+
+    def grab(_event):
+        if time.monotonic() - frame["time"] < WEB_FRAME_SECONDS:
+            return
+        image = Image.frombuffer("RGBA", fig.canvas.get_width_height(physical=True), fig.canvas.buffer_rgba())
+        image = image.convert("RGB")
+        image = image.resize((WEB_WIDTH, round(image.height * WEB_WIDTH / image.width)))
+        jpeg = io.BytesIO()
+        image.save(jpeg, "JPEG", quality=75)
+        frame["jpeg"], frame["time"] = jpeg.getvalue(), time.monotonic()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/":
+                body, kind = WEB_PAGE.encode(), "text/html; charset=utf-8"
+            elif self.path.startswith("/map.jpg"):
+                body, kind = frame["jpeg"], "image/jpeg"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            if self.path != "/reset":
+                self.send_error(404)
+                return
+            state.reset_requested.set()
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass  # no per-request noise in the terminal
+
+    fig.canvas.mpl_connect("draw_event", grab)
+    server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    for address in web_addresses():
+        print(f"Web view: http://{address}:{WEB_PORT}")
+    return server
+
+
+def web_addresses():
+    """Ways other devices can reach this Mac: Bonjour name, home network IP, Tailscale name and IP."""
+    def run(*command):
+        try:
+            return subprocess.run(command, capture_output=True, text=True, timeout=3).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    addresses = []
+    if bonjour := run("scutil", "--get", "LocalHostName"):
+        addresses.append(f"{bonjour}.local")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("192.0.2.1", 9))  # no packet is sent; this just picks the outgoing interface
+            addresses.append(s.getsockname()[0])
+        except OSError:
+            pass
+    tailscale = shutil.which("tailscale") or "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    if status := run(tailscale, "status", "--self", "--peers=false"):
+        ip, name = status.split()[:2]
+        addresses += [name, ip]
+    return addresses
+
+
 def main():
     state = RadarState()
     state.open_live_log()
@@ -475,6 +617,7 @@ def main():
     start_radar_thread(state)
     fig, update = make_map(state)
     fig.canvas.manager.set_window_title("LD2460 radar map")
+    start_web_view(fig, state)
     _animation = FuncAnimation(fig, update, interval=50, cache_frame_data=False)  # keep a reference
     plt.show()
 

@@ -22,6 +22,9 @@ import time
 from bleak import BleakClient, BleakScanner
 
 NOTIFY_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
+SCAN_SECONDS = 10
+CONNECT_SECONDS = 20
+QUIET_SECONDS = 15  # the radar reports ~7 times a second, so this much silence means the link is dead
 HEADER = bytes.fromhex("f4f3f2f1")
 TAIL = bytes.fromhex("f8f7f6f5")
 
@@ -56,38 +59,59 @@ def parse_frames(buffer):
 
 async def watch(on_targets, name_prefix="LD2460", reconnect=None):
     """Connect to the radar and call on_targets(list of (x, y)) for every report. Reconnects forever.
-    Setting the optional reconnect event (an asyncio.Event) drops the connection and connects again."""
+    Setting the optional reconnect event (an asyncio.Event) drops the connection and connects again.
+    Every Bluetooth step has a timeout and a silent radar is reconnected, because macOS Bluetooth
+    can hang without an error (after the laptop sleeps, for example)."""
     reconnect = reconnect or asyncio.Event()
     while True:
-        device = await BleakScanner.find_device_by_filter(
-            lambda d, adv: (adv.local_name or d.name or "").startswith(name_prefix), timeout=10)
+        try:
+            device = await asyncio.wait_for(BleakScanner.find_device_by_filter(
+                lambda d, adv: (adv.local_name or d.name or "").startswith(name_prefix), timeout=SCAN_SECONDS),
+                SCAN_SECONDS + 5)
+        except Exception as e:
+            log(f"Radar scan failed ({type(e).__name__} {e}), retrying")
+            await asyncio.sleep(2)
+            continue
         if device is None:
             log(f"No {name_prefix}* radar found, retrying")
             continue
+
         disconnected = asyncio.Event()
         buffer = bytearray()
+        last_report = time.monotonic()
 
         def on_notify(_, data):
+            nonlocal last_report
+            last_report = time.monotonic()
             buffer.extend(data)
             for targets in parse_frames(buffer):
                 on_targets(targets)
 
+        client = BleakClient(device, disconnected_callback=lambda _: disconnected.set())
         try:
-            async with BleakClient(device, disconnected_callback=lambda _: disconnected.set()) as client:
-                log(f"Connected to {device.name}")
-                await client.start_notify(NOTIFY_UUID, on_notify)
-                waits = [asyncio.create_task(disconnected.wait()), asyncio.create_task(reconnect.wait())]
-                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
-                for task in waits:
-                    task.cancel()
-            if reconnect.is_set():
-                reconnect.clear()
-                log("Reconnecting to the radar as requested")
+            await asyncio.wait_for(client.connect(), CONNECT_SECONDS)
+            await asyncio.wait_for(client.start_notify(NOTIFY_UUID, on_notify), CONNECT_SECONDS)
+            log(f"Connected to {device.name}")
+            last_report = time.monotonic()
+            while not disconnected.is_set():
+                if reconnect.is_set():
+                    reconnect.clear()
+                    log("Reconnecting to the radar as requested")
+                    break
+                if time.monotonic() - last_report > QUIET_SECONDS:
+                    log(f"No reports from the radar for {QUIET_SECONDS} s, reconnecting")
+                    break
+                await asyncio.sleep(0.5)
             else:
                 log("Radar disconnected, reconnecting")
         except Exception as e:
-            log(f"Radar connection failed ({e}), retrying")
+            log(f"Radar connection failed ({type(e).__name__} {e}), retrying")
             await asyncio.sleep(2)
+        finally:
+            try:
+                await asyncio.wait_for(client.disconnect(), 10)
+            except Exception:
+                pass
 
 
 async def main():
