@@ -23,7 +23,7 @@ already in the room when the app starts needs to walk through the entrance.
 Show: showDirector.py runs the show from where people are. Its cues (welcome,
 take your seats, show, scare, goodbye, reset) appear as messages in the panel at
 the top, and showPlayer.py plays them: the still image / Bee Gees / startle in a
-Show window, show audio on output 5 and announcements on output 6 of the UMC1820.
+Show window, show audio on output 6 and announcements on output 5 of the UMC1820.
 With --dry-run nothing is played, for checking the logic.
 
 Every radar report is also written to radarMaps/live.log (cleared on startup),

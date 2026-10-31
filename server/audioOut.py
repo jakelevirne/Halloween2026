@@ -8,6 +8,7 @@ announcement plays on another). Each sound's volume can change while it plays.
     out = AudioOut("UMC1820")
     out.start()
     music = out.play(load_audio("song.mp4", out.rate), channel=5)
+    rumble = out.play(samples, channel=(1, 2, 3, 4))   # the same on several outputs
     music.gain = 0.25      # turn it down
     music.stop()
 """
@@ -30,9 +31,9 @@ def load_audio(path, rate, start=0.0, filters=None):
 
 
 class Sound:
-    def __init__(self, samples, channel, gain):
+    def __init__(self, samples, channels, gain):
         self.samples = samples
-        self.channel = channel  # counting from 1, like the labels on the interface
+        self.channels = channels  # counting from 1, like the labels on the interface
         self.gain = gain
         self.position = 0
         self.seek_to = None  # set to a sample index to jump there (applied on the audio thread)
@@ -71,9 +72,12 @@ class AudioOut:
         self._stream.close()
 
     def play(self, samples, channel, gain=1.0):
-        if not 1 <= channel <= self.channels:
-            raise ValueError(f"{self.name} has outputs 1 to {self.channels}, not {channel}")
-        sound = Sound(samples, channel, gain)
+        """Play samples on one output (channel=5) or the same on several (channel=(1, 2, 3, 4))."""
+        channels = (channel,) if isinstance(channel, int) else tuple(channel)
+        for c in channels:
+            if not 1 <= c <= self.channels:
+                raise ValueError(f"{self.name} has outputs 1 to {self.channels}, not {c}")
+        sound = Sound(samples, channels, gain)
         with self._lock:
             self._sounds.append(sound)
         return sound
@@ -93,7 +97,8 @@ class AudioOut:
                 if sound.seek_to is not None:
                     sound.position, sound.seek_to = sound.seek_to, None
                 chunk = sound.samples[sound.position:sound.position + frames]
-                outdata[:len(chunk), sound.channel - 1] += chunk * sound.gain
+                for channel in sound.channels:
+                    outdata[:len(chunk), channel - 1] += chunk * sound.gain
                 sound.position += frames
                 if sound.position >= len(sound.samples):
                     sound.done.set()

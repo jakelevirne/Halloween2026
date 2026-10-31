@@ -6,9 +6,10 @@ Screen (mpv, picture only):
     show, the startle blended over them for the scare, and back to the still
     when the Bee Gees clip ends or the house resets.
 Sound (the audio interface, through audioOut.py):
-    output 5: the Bee Gees, silenced while the startle plays, turned down for
+    output 6: the Bee Gees, silenced while the startle plays, turned down for
               the final announcement
-    output 6: the announcements in media/announcements/
+    output 5: the announcements in media/announcements/
+    outputs 1-4: the chair bass shakers, a 45 Hz shake starting with the startle's roar
 
     player = ShowPlayer()
     await player.start()
@@ -20,20 +21,26 @@ like the radar map.
 
 import asyncio
 import threading
-from pathlib import Path
+
+import numpy as np
 
 from audioOut import AudioOut, load_audio
 from scareVideo import (BLEND_MODE, LOOP_DIM, LOOP_GAIN_DB, LOOP_VIDEO, MEDIA_DIR, SCARE_AUDIO_DELAY,
                         SCARE_GAIN_DB, SCARE_START_SECONDS, SCARE_VIDEO, Mpv, log)
 
 AUDIO_DEVICE = "UMC1820"
-SHOW_CHANNEL = 5             # powered speaker for the Bee Gees and the startle
-ANNOUNCE_CHANNEL = 6         # powered speaker for announcements
+SHOW_CHANNEL = 6             # powered speaker for the Bee Gees and the startle
+ANNOUNCE_CHANNEL = 5         # powered speaker for announcements
+BASS_CHANNELS = (1, 2, 3, 4) # chair bass shakers, one per chair
+BASS_HZ = 45                 # what the shakers respond to
+BASS_LEVEL = 0.5             # the strength that felt right in the audioTest.py --tone test
+BASS_ROAR_SECONDS = 0.5      # the startle's roar, from its 2.6 s start point
 STILL_IMAGE = MEDIA_DIR / "BeeGeesStill.jpg"
 ANNOUNCEMENTS_DIR = MEDIA_DIR / "announcements"
 ANNOUNCEMENTS = {"welcome": "welcome.aiff", "take_seats": "take_seats.aiff", "outro": "outro.aiff"}
 DUCKED_GAIN = 0.25           # Bee Gees under the final announcement (-12 dB)
-FULLSCREEN = False           # True for the projector
+FULLSCREEN = False           # True: always fullscreen (the projector)
+FULLSCREEN_DURING_SHOW = True  # otherwise fullscreen while the Bee Gees play, a window for the still
 PASSTHROUGH_GRAPH = "[vid1]null[vo]"  # picture only: the audio is played separately
 
 
@@ -48,6 +55,7 @@ class ShowPlayer:
         self._bee_gees = None         # the playing Bee Gees Sound
         self._bee_gees_level = 1.0    # its gain when the startle isn't playing
         self._scare = None            # the playing startle Sound
+        self._shake = None            # the playing chair shake Sound
         self._waiting_for_bee_gees = False
 
     async def start(self):
@@ -57,6 +65,7 @@ class ShowPlayer:
         self._bee_gees_audio = load_audio(LOOP_VIDEO, rate, filters=f"volume={LOOP_GAIN_DB}dB")
         self._scare_audio = load_audio(SCARE_VIDEO, rate, start=SCARE_START_SECONDS,
                                        filters=f"volume={SCARE_GAIN_DB}dB,alimiter=limit=0.95:level=disabled")
+        self._bass = bass_shake(rate)
         self._announcements = {}
         for cue_name, file in ANNOUNCEMENTS.items():
             samples = load_audio(ANNOUNCEMENTS_DIR / file, rate)
@@ -66,7 +75,7 @@ class ShowPlayer:
         args = ["--idle=yes", "--force-window=immediate", "--keep-open=yes", "--no-audio",
                 "--image-display-duration=inf", "--osd-level=0", "--no-osc", "--cursor-autohide=always",
                 "--hwdec=auto-copy", f"--lavfi-complex={PASSTHROUGH_GRAPH}", "--autofit=50%",
-                "--title=Show"]
+                "--title=Show", "--native-fs=no"]  # instant fullscreen, not macOS's animated one
         if self.fullscreen:
             args.append("--fs")
         if self.screen is not None:
@@ -101,6 +110,8 @@ class ShowPlayer:
     async def _show_still(self):
         self._showing = "still"
         await self.video.command("loadfile", str(STILL_IMAGE), "replace")
+        if FULLSCREEN_DURING_SHOW and not self.fullscreen:
+            await self.video.set("fullscreen", False)
 
     async def _start_bee_gees(self):
         await self._stop_show(still=False)
@@ -108,6 +119,8 @@ class ShowPlayer:
         self._showing = "bee_gees"
         self._waiting_for_bee_gees = True  # the audio starts when the first frame is up (playback-restart)
         await self.video.command("loadfile", str(LOOP_VIDEO), "replace", -1, "pause=no")
+        if FULLSCREEN_DURING_SHOW:
+            await self.video.set("fullscreen", True)
 
     async def _start_scare(self):
         if self._showing != "bee_gees" or self._scare:
@@ -119,6 +132,7 @@ class ShowPlayer:
         if self._bee_gees:
             self._bee_gees.gain = 0  # hard cut to the startle
         self._scare = self.audio.play(self._scare_audio, SHOW_CHANNEL)
+        self._shake = self.audio.play(self._bass, BASS_CHANNELS)  # same instant, so it lines up with the roar
         asyncio.create_task(self._end_scare(self._scare))
 
     async def _end_scare(self, scare):
@@ -139,10 +153,10 @@ class ShowPlayer:
                 self._bee_gees.gain = self._bee_gees_level
 
     async def _stop_show(self, still=True):
-        for sound in (self._bee_gees, self._scare):
+        for sound in (self._bee_gees, self._scare, self._shake):
             if sound:
                 sound.stop()
-        self._bee_gees = self._scare = None
+        self._bee_gees = self._scare = self._shake = None
         self._waiting_for_bee_gees = False
         await self.video.set("lavfi-complex", PASSTHROUGH_GRAPH)
         if still:
@@ -169,6 +183,19 @@ class ShowPlayer:
             if message.get("data") and self._showing == "bee_gees":
                 log("Bee Gees clip ended, back to the still")
                 asyncio.create_task(self._stop_show())
+
+
+def bass_shake(rate):
+    """45 Hz for the chair shakers, lined up with the startle audio: nothing until the roar,
+    a steady shake through the loudest 2 s, then four 0.4 s pulses that fade out."""
+    t = np.arange(int(rate * (BASS_ROAR_SECONDS + 6))) / rate
+    envelope = ((t >= BASS_ROAR_SECONDS) & (t < BASS_ROAR_SECONDS + 2)).astype(np.float32)
+    for pulse in range(4):
+        start = BASS_ROAR_SECONDS + 2.4 + pulse * 0.8
+        envelope[(t >= start) & (t < start + 0.4)] = 0.8 - pulse * 0.2
+    ramp = int(rate * 0.02)  # soften every on/off edge so the shakers don't click
+    envelope = np.convolve(envelope, np.ones(ramp) / ramp, mode="same")
+    return (np.sin(2 * np.pi * BASS_HZ * t) * envelope * BASS_LEVEL).astype(np.float32)
 
 
 def start_in_thread(**kwargs):
