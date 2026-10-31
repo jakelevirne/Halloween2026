@@ -16,7 +16,7 @@ The run:
                else ask again
     show       Bee Gees for about 15 s, then the scare
     scare      the startle plays
-    leaving    1 s after the startle: thank them and point them to the exit.
+    leaving    2.5 s after the startle: thank them and point them to the exit.
                Reset once everyone is out (or 2 minutes after the scare, in case
                of phantoms)
 """
@@ -33,7 +33,7 @@ SEATING_SECONDS = 15           # "take your seats" -> show (or ask again)
 SHOW_SECONDS = 15              # Bee Gees before the scare...
 SHOW_JITTER_SECONDS = 2.5      # ...give or take this much
 SCARE_SECONDS = 15.4           # the startle clip, from its 2.6 s start point to the end
-OUTRO_DELAY_SECONDS = 1        # startle finished -> final announcement (its end is already a wind-down)
+OUTRO_DELAY_SECONDS = 2.5      # startle finished -> final announcement (its end is already a wind-down)
 RESET_AFTER_SCARE_SECONDS = 120  # reset this long after the scare even if phantoms still look like people
 TAKE_SEATS = "Please take your seats. The show is about to begin."
 

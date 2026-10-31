@@ -25,8 +25,8 @@ import threading
 import numpy as np
 
 from audioOut import AudioOut, load_audio
-from scareVideo import (BLEND_MODE, LOOP_DIM, LOOP_GAIN_DB, LOOP_VIDEO, MEDIA_DIR, SCARE_AUDIO_DELAY,
-                        SCARE_GAIN_DB, SCARE_START_SECONDS, SCARE_VIDEO, Mpv, log)
+from scareVideo import (BLEND_MODE, LOOP_DIM, LOOP_VIDEO, MEDIA_DIR, SCARE_AUDIO_DELAY, SCARE_GAIN_DB,
+                        SCARE_START_SECONDS, SCARE_VIDEO, Mpv, log)
 
 AUDIO_DEVICE = "UMC1820"
 SHOW_CHANNEL = 6             # powered speaker for the Bee Gees and the startle
@@ -38,7 +38,8 @@ BASS_ROAR_SECONDS = 0.5      # the startle's roar, from its 2.6 s start point
 STILL_IMAGE = MEDIA_DIR / "BeeGeesStill.jpg"
 ANNOUNCEMENTS_DIR = MEDIA_DIR / "announcements"
 ANNOUNCEMENTS = {"welcome": "welcome.aiff", "take_seats": "take_seats.aiff", "outro": "outro.aiff"}
-DUCKED_GAIN = 0.25           # Bee Gees under the final announcement (-12 dB)
+BEE_GEES_GAIN_DB = -20       # the Bee Gees track is mastered very loud; this keeps it well under the startle
+DUCKED_GAIN = 0.25           # Bee Gees under the final announcement (a further -12 dB)
 FULLSCREEN = False           # True: always fullscreen (the projector)
 FULLSCREEN_DURING_SHOW = True  # otherwise fullscreen while the Bee Gees play, a window for the still
 PASSTHROUGH_GRAPH = "[vid1]null[vo]"  # picture only: the audio is played separately
@@ -62,7 +63,7 @@ class ShowPlayer:
         self.audio = AudioOut(AUDIO_DEVICE)
         rate = self.audio.rate
         log(f"Loading show audio for {self.audio.name} ({rate} Hz)")
-        self._bee_gees_audio = load_audio(LOOP_VIDEO, rate, filters=f"volume={LOOP_GAIN_DB}dB")
+        self._bee_gees_audio = load_audio(LOOP_VIDEO, rate, filters=f"volume={BEE_GEES_GAIN_DB}dB")
         self._scare_audio = load_audio(SCARE_VIDEO, rate, start=SCARE_START_SECONDS,
                                        filters=f"volume={SCARE_GAIN_DB}dB,alimiter=limit=0.95:level=disabled")
         self._bass = bass_shake(rate)
