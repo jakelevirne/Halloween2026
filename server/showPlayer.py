@@ -34,7 +34,8 @@ ANNOUNCE_CHANNEL = 5         # powered speaker for announcements
 BASS_CHANNELS = (1, 2, 3, 4) # chair bass shakers, one per chair
 BASS_HZ = 45                 # what the shakers respond to
 BASS_LEVEL = 0.5             # the strength that felt right in the audioTest.py --tone test
-BASS_ROAR_SECONDS = 0.5      # the startle's roar, from its 2.6 s start point
+BASS_ROAR_SECONDS = 0.2      # start shaking 0.3 s before the startle's roar (0.5 s in), since the
+                             # shakers take a moment to build up and it felt late starting right on it
 STILL_IMAGE = MEDIA_DIR / "BeeGeesStill.jpg"
 ANNOUNCEMENTS_DIR = MEDIA_DIR / "announcements"
 ANNOUNCEMENTS = {"welcome": "welcome.aiff", "take_seats": "take_seats.aiff", "outro": "outro.aiff"}
