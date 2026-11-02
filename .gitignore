@@ -10,3 +10,6 @@ __pycache__/
 # Generated data and analysis outputs
 server/data/
 server/radarMaps/live.log
+
+# Purchased music: keep it local, not on GitHub
+media/music/

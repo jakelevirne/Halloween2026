@@ -8,7 +8,8 @@ Screen (mpv, picture only):
 Sound (the audio interface, through audioOut.py):
     output 6: the Bee Gees, silenced while the startle plays, turned down for
               the final announcement
-    output 5: the announcements in media/announcements/
+    output 5: the announcements in media/announcements/, and background music looping
+              whenever the show isn't, turned down while an announcement plays
     outputs 1-4: the chair bass shakers, a 45 Hz shake starting with the startle's roar,
               and an unfelt 18 kHz warm-up when a group arrives so the amps aren't in standby
 
@@ -34,7 +35,7 @@ SHOW_CHANNEL = 6             # powered speaker for the Bee Gees and the startle
 ANNOUNCE_CHANNEL = 5         # powered speaker for announcements
 BASS_CHANNELS = (1, 2, 3, 4) # chair bass shakers, one per chair
 BASS_HZ = 45                 # what the shakers respond to
-BASS_LEVEL = 0.5             # the strength that felt right in the audioTest.py --tone test
+BASS_LEVEL = 0.6             # 20% over the 0.5 that felt right in the audioTest.py --tone test
 BASS_ROAR_SECONDS = 0.3      # when the shake starts, from the startle's 2.6 s start point: 0.2 s before
                              # its roar (0.5 s in), which felt better than starting right on it
 WARMUP_HZ = 18000            # a tone at the welcome to wake the amps from auto-standby (they're slow to wake,
@@ -43,9 +44,12 @@ WARMUP_SECONDS = 4           # it isn't felt, and too high for most adults to he
 STILL_IMAGE = MEDIA_DIR / "BeeGeesStill.jpg"
 ANNOUNCEMENTS_DIR = MEDIA_DIR / "announcements"
 ANNOUNCEMENTS = {"welcome": "welcome.aiff", "take_seats": "take_seats.aiff", "outro": "outro.aiff"}
+MUSIC = MEDIA_DIR / "music" / "DiscoInferno-TinaTurner.m4a"  # bought music stays local (media/music/ isn't in git)
+MUSIC_GAIN_DB = -19          # background level
+MUSIC_DUCKED_GAIN = 0.25     # under an announcement (a further -12 dB)
 BEE_GEES_GAIN_DB = -20       # the Bee Gees track is mastered very loud; this keeps it well under the startle
 DUCKED_GAIN = 0.25           # Bee Gees under the final announcement (a further -12 dB)
-FULLSCREEN = False           # True: always fullscreen (the projector)
+FULLSCREEN = True            # always fullscreen, the still too (False: a window for the still)
 FULLSCREEN_DURING_SHOW = True  # otherwise fullscreen while the Bee Gees play, a window for the still
 PASSTHROUGH_GRAPH = "[vid1]null[vo]"  # picture only: the audio is played separately
 
@@ -62,6 +66,8 @@ class ShowPlayer:
         self._bee_gees_level = 1.0    # its gain when the startle isn't playing
         self._scare = None            # the playing startle Sound
         self._shake = None            # the playing chair shake Sound
+        self._music = None            # the background music Sound, paused during the show
+        self._announcement = None     # the latest announcement Sound
         self._waiting_for_bee_gees = False
 
     async def start(self):
@@ -89,6 +95,11 @@ class ShowPlayer:
             args += [f"--screen={self.screen}", f"--fs-screen={self.screen}"]
         await self.video.start(args)
         await self.video.command("observe_property", 1, "eof-reached")
+        if MUSIC.exists():
+            music = load_audio(MUSIC, rate, filters=f"volume={MUSIC_GAIN_DB}dB")
+            self._music = self.audio.play(music, ANNOUNCE_CHANNEL, loop=True)
+        else:
+            log(f"No background music: {MUSIC} not found")
         await self._show_still()
         self._ready.set()
         log("Show player ready")
@@ -99,7 +110,7 @@ class ShowPlayer:
         if name == "welcome":
             self.audio.play(self._warmup, BASS_CHANNELS)
         if name in self._announcements:
-            self.audio.play(self._announcements[name], ANNOUNCE_CHANNEL)
+            self._announce(self._announcements[name])
         if name == "show_start":
             await self._start_bee_gees()
         elif name == "scare":
@@ -116,14 +127,29 @@ class ShowPlayer:
         if self.audio:
             self.audio.close()
 
+    def _announce(self, samples):
+        self._announcement = announcement = self.audio.play(samples, ANNOUNCE_CHANNEL)
+        if self._music:
+            self._music.gain = MUSIC_DUCKED_GAIN
+
+        async def unduck():
+            await asyncio.sleep(len(samples) / self.audio.rate + 0.3)
+            if self._music and self._announcement is announcement:  # not if another one started meanwhile
+                self._music.gain = 1.0
+        asyncio.create_task(unduck())
+
     async def _show_still(self):
         self._showing = "still"
+        if self._music:
+            self._music.paused = False  # carries on where it left off
         await self.video.command("loadfile", str(STILL_IMAGE), "replace")
         if FULLSCREEN_DURING_SHOW and not self.fullscreen:
             await self.video.set("fullscreen", False)
 
     async def _start_bee_gees(self):
         await self._stop_show(still=False)
+        if self._music:
+            self._music.paused = True
         self._bee_gees_level = 1.0
         self._showing = "bee_gees"
         self._waiting_for_bee_gees = True  # the audio starts when the first frame is up (playback-restart)

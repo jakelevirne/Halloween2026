@@ -10,10 +10,10 @@ house loop can act on the same cues for real.
 The run:
     empty      nothing happens until someone gets past the stairs
     welcome    someone reached Backstage or Main stage: "the show begins shortly"
-    seating    20 s after anyone reached Backstage, or 5 s after anyone reached
+    seating    25 s after anyone reached Backstage, or 5 s after anyone reached
                Main stage, whichever comes first: "take your seats, the show is
-               about to begin". 15 s later, start if anyone is in Main stage,
-               else ask again
+               about to begin". 15 s later, start, assuming they're seated (the
+               radar often loses seated people, so it doesn't check)
     show       Bee Gees for about 15 s, then the scare
     scare      the startle plays
     leaving    2.5 s after the startle: thank them and point them to the exit.
@@ -27,9 +27,9 @@ from dataclasses import dataclass
 BACKSTAGE = "Backstage"        # zone labels in radarMaps/layout.json
 MAIN_STAGE = "Main stage"
 ENTRANCE = "Entrance"          # in the entrance but past the stairs: at the door or outside, so not inside
-BACKSTAGE_SECONDS = 20         # first person in Backstage -> "take your seats"...
+BACKSTAGE_SECONDS = 25         # first person in Backstage -> "take your seats"...
 MAIN_STAGE_SECONDS = 5         # ...or first person in Main stage -> "take your seats", whichever is first
-SEATING_SECONDS = 15           # "take your seats" -> show (or ask again)
+SEATING_SECONDS = 15           # "take your seats" -> show
 SHOW_SECONDS = 15              # Bee Gees before the scare...
 SHOW_JITTER_SECONDS = 2.5      # ...give or take this much
 SCARE_SECONDS = 15.4           # the startle clip, from its 2.6 s start point to the end
@@ -50,13 +50,14 @@ class ShowDirector:
         self._since = 0.0          # when the current state (or seating announcement) started
         self._first_in = {}        # zone -> when someone first reached it, during the welcome
         self._scare_at = 0.0
+        self._manual = False       # started by hand: ignore the radar until the next reset
 
     def update(self, now, zones):
         """now: seconds (any steady clock). zones: one entry per tracked person, the zone label
         they're in, ENTRANCE if they're at the door past the stairs, or None.
         Returns a list of Cues to act on now."""
         zones = [zone for zone in zones if zone != ENTRANCE]  # at the door counts as gone
-        inside = len(zones) > 0
+        inside = len(zones) > 0 or self._manual
         main_stage = zones.count(MAIN_STAGE)
         elapsed = now - self._since
 
@@ -76,11 +77,9 @@ class ShowDirector:
                 return self._go("seating", now, Cue("take_seats", TAKE_SEATS))
 
         elif self.state == "seating" and elapsed >= SEATING_SECONDS:
-            if main_stage:
-                self._scare_at = now + SHOW_SECONDS + random.uniform(-SHOW_JITTER_SECONDS, SHOW_JITTER_SECONDS)
-                return self._go("show", now, Cue("show_start", f"Show starting: {main_stage} in Main stage. "
-                                                               f"Scare in {self._scare_at - now:.0f} s."))
-            return self._go("seating", now, Cue("take_seats", f"Nobody in Main stage yet. {TAKE_SEATS}"))
+            self._scare_at = now + SHOW_SECONDS + random.uniform(-SHOW_JITTER_SECONDS, SHOW_JITTER_SECONDS)
+            return self._go("show", now, Cue("show_start", f"Show starting: {main_stage} seen in Main stage. "
+                                                           f"Scare in {self._scare_at - now:.0f} s."))
 
         elif self.state == "show" and now >= self._scare_at:
             return self._go("scare", now, Cue("scare", "SCARE!"))
@@ -93,6 +92,8 @@ class ShowDirector:
             if not inside:
                 return self._go("empty", now, Cue("reset", "Everyone is out. Ready for the next group."))
             if now - self._scare_at >= RESET_AFTER_SCARE_SECONDS:
+                if self._manual:
+                    return self._go("empty", now, Cue("reset", "Show started by hand is over. Ready for the next group."))
                 return self._go("empty", now,
                                 Cue("reset", f"Still {len(zones)} inside {RESET_AFTER_SCARE_SECONDS // 60} minutes "
                                              f"after the scare, probably phantoms. Resetting."),
@@ -108,7 +109,7 @@ class ShowDirector:
             due = self._seats_due(now)
             return f"Welcome: take-your-seats call in {due:.0f} s" if due < float("inf") else "Welcome"
         if self.state == "seating":
-            return f"Seating: show check in {SEATING_SECONDS - elapsed:.0f} s (needs someone in {MAIN_STAGE})"
+            return f"Seating: show starts in {SEATING_SECONDS - elapsed:.0f} s"
         if self.state == "show":
             return f"Show: scare in {self._scare_at - now:.0f} s"
         if self.state == "scare":
@@ -121,11 +122,21 @@ class ShowDirector:
         waits = {BACKSTAGE: BACKSTAGE_SECONDS, MAIN_STAGE: MAIN_STAGE_SECONDS}
         return min((since + waits[zone] - now for zone, since in self._first_in.items()), default=float("inf"))
 
+    def start(self, now):
+        """Run the show from the welcome on, whatever the radar sees (for when it has lost a group that's
+        inside). Until the next reset the group counts as inside; it resets by itself
+        RESET_AFTER_SCARE_SECONDS after the scare."""
+        self._manual = True
+        self._first_in = {BACKSTAGE: now}
+        return self._go("welcome", now, Cue("welcome", "Started by hand. Welcome! The show begins shortly."))
+
     def reset(self, now):
         """Back to waiting for a group, e.g. when the operator resets by hand."""
         return self._go("empty", now, Cue("reset", "Manual reset. Ready for the next group."))
 
     def _go(self, state, now, *cues):
+        if state == "empty":
+            self._manual = False
         self.state = state
         self._since = now
         return list(cues)

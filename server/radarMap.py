@@ -32,10 +32,12 @@ followed with: tail -f radarMaps/live.log
 
 Web view: the map is also served at http://<this mac>:8460 for a phone or another
 computer on the same network (or Tailscale). The page shows a picture of the map,
-refreshed about twice a second, with a Reset show button.
+refreshed about twice a second, with Start show and Reset show buttons.
 
 Manual reset: press r in the map window (or Reset show on the web view) to clear
 everyone and put the show back to waiting for a group.
+Manual start: Start show on the web view runs the show from the welcome on,
+ignoring the radar, for when it has lost a group that's inside.
 
 Usage:
     uv run radarMap.py
@@ -92,22 +94,27 @@ WEB_PAGE = """<!doctype html>
   img { display: block; width: 100%; max-width: 900px; margin: auto; }
   .controls { text-align: center; padding: 12px; color: white; }
   button { font-size: 18px; padding: 10px 24px; border: 0; border-radius: 8px; background: #ff4040; color: white; }
+  #start { background: #20a040; margin-right: 12px; }
 </style>
 </head><body><img id="map" src="map.jpg" alt="radar map">
-<div class="controls"><button id="reset">Reset show</button> <span id="note"></span></div>
+<div class="controls"><button id="start">Start show</button><button id="reset">Reset show</button>
+<span id="note"></span></div>
 <script>
-  // Reset: clears everyone and puts the show back to waiting for a group
-  document.getElementById("reset").onclick = async () => {
-    if (!confirm("Reset the show and clear everyone from the map?")) return;
+  // Start: runs the show from the welcome on, ignoring the radar.
+  // Reset: clears everyone and puts the show back to waiting for a group.
+  async function send(action, question) {
+    if (!confirm(question)) return;
     const note = document.getElementById("note");
     try {
-      const response = await fetch("reset", { method: "POST" });
-      note.textContent = response.ok ? "Reset sent" : "Reset failed";
+      const response = await fetch(action, { method: "POST" });
+      note.textContent = response.ok ? `${action} sent` : `${action} failed`;
     } catch (e) {
-      note.textContent = "Reset failed";
+      note.textContent = `${action} failed`;
     }
     setTimeout(() => note.textContent = "", 3000);
-  };
+  }
+  document.getElementById("start").onclick = () => send("start", "Start the show now, ignoring the radar?");
+  document.getElementById("reset").onclick = () => send("reset", "Reset the show and clear everyone from the map?");
 
   // Load each new frame off screen and swap it in, so the picture never flickers
   const map = document.getElementById("map");
@@ -137,6 +144,7 @@ class RadarState:
         self.director = ShowDirector()
         self.request_reconnect = lambda: None  # set by start_radar_thread
         self.reset_requested = threading.Event()  # r key or the web view's Reset button; handled on the GUI thread
+        self.start_requested = threading.Event()  # the web view's Start button
         self.on_cue = lambda name: None  # set to the show player's send in main()
 
     def people_now(self):
@@ -372,6 +380,9 @@ def make_map(state):
             state.reset_requested.clear()
             state.reset_tracker()
             cues += state.director.reset(now)
+        if state.start_requested.is_set():
+            state.start_requested.clear()
+            cues += state.director.start(now)
         zones = [zone_for_show(x, y) for x, y in state.people_now()]
         for cue in cues + state.director.update(now, zones):
             line = f"{time.strftime('%H:%M:%S')}  {cue.text}"
@@ -574,10 +585,11 @@ def start_web_view(fig, state):
             self.wfile.write(body)
 
         def do_POST(self):
-            if self.path != "/reset":
+            requests = {"/reset": state.reset_requested, "/start": state.start_requested}
+            if self.path not in requests:
                 self.send_error(404)
                 return
-            state.reset_requested.set()
+            requests[self.path].set()
             self.send_response(204)
             self.end_headers()
 
